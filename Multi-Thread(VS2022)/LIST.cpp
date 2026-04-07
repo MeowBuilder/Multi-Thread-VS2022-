@@ -12,10 +12,17 @@ constexpr int MAX_THREADS = 16;
 constexpr int NUM_TEST = 400'0000;
 constexpr int RANGE = 1000;
 
+class DUMMY_MUTEX {
+public:
+	void lock() {};
+	void unlock() {};
+};
+
 class NODE {
 public:
 	int key;
 	NODE* next;
+	bool removed = false;
 	std::mutex mtx;
 
 	NODE(int key_value) : key(key_value), next(nullptr) {}
@@ -25,12 +32,6 @@ public:
 	void unlock() {
 		mtx.unlock();
 	}
-};
-
-class DUMMY_MUTEX {
-public:
-	void lock() {};
-	void unlock() {};
 };
 
 class CLIST {
@@ -241,9 +242,9 @@ private:
 	std::queue<NODE*> free_pool;
 public:
 	MEMORY_POOL() {
-		for (int i = 0;i < NUM_TEST / 3; ++i) {
-			get_pool.push(new NODE(0));
-		}
+		//for (int i = 0;i < NUM_TEST / 3; ++i) {
+		//	get_pool.push(new NODE(0));
+		//}
 	}
 	~MEMORY_POOL() {
 		while (!get_pool.empty()) {
@@ -265,6 +266,7 @@ public:
 			get_pool.pop();
 			node->key = value;
 			node->next = nullptr;
+			node->removed = false;
 			return node;
 		}
 	}
@@ -274,7 +276,6 @@ public:
 	void recycle_nodes() {
 		get_pool = std::move(free_pool);
 	}
-
 };
 
 MEMORY_POOL memory_pool[MAX_THREADS];
@@ -345,10 +346,14 @@ public:
 		while (true) {
 			NODE* pred = head;
 			NODE* curr = pred->next;
-			while (curr->key != key && curr != tail) {
+			while (curr->key < key) {
 				pred = curr;
 				curr = curr->next;
 			}
+			//while (curr->key != key && curr != tail) { // 왜인지 멀티스레드에서 코어 늘어날수록 느려짐 -> 탐색이 오래 걸림(Tail까지 탐색) -> 탐색이 오래 걸리면 validate 실패확률 증가
+			//	pred = curr;
+			//	curr = curr->next;
+			//}
 
 			pred->lock(); curr->lock();
 			if (!validate(pred, curr)) {
@@ -366,16 +371,30 @@ public:
 				pred->unlock(); curr->unlock();
 				return false;
 			}
+			//if (curr->key != key) {
+			//	pred->unlock(); curr->unlock();
+			//	return false;
+			//}
+			//else {
+			//	pred->next = curr->next;
+			//	curr->unlock(); pred->unlock();
+			//	memory_pool[thread_id].free_node(curr);
+			//	return true;
+			//}
 		}
 	}
 	bool Contains(int key) {
 		while (true) {
 			NODE* pred = head;
 			NODE* curr = pred->next;
-			while (curr->key != key && curr != tail) {
+			while (curr->key < key) {
 				pred = curr;
 				curr = curr->next;
 			}
+			//while (curr->key != key && curr != tail) {
+			//	pred = curr;
+			//	curr = curr->next;
+			//}
 
 			pred->lock(); curr->lock();
 			if (!validate(pred, curr)) {
@@ -409,7 +428,364 @@ public:
 	}
 };
 
-OLIST my_set;
+class ZLIST {
+	NODE* head, * tail;
+public:
+	ZLIST() {
+		std::cout << "Testing lazy synchronization List\n";
+		head = new NODE{ std::numeric_limits<int>::min() };
+		tail = new NODE{ std::numeric_limits<int>::max() };
+		head->next = tail;
+	}
+	~ZLIST() {}
+
+	void clear() {
+		NODE* current = head->next;
+		while (head->next != tail) {
+			NODE* temp = head->next;
+			head->next = temp->next;
+			delete temp;
+		}
+	}
+
+	bool validate(NODE* pred, NODE* curr) {
+		return ((!pred->removed) && (!curr->removed) && (pred->next == curr));
+	}
+
+	bool Add(int key) {
+		while (true)
+		{
+			NODE* pred = head;
+			NODE* curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			pred->lock(); curr->lock();
+			if (false == validate(pred, curr)) {
+				pred->unlock(); curr->unlock();
+				continue;
+			}
+
+			if (curr->key == key)
+			{
+				pred->unlock(); curr->unlock();
+				return false;
+			}
+			else
+			{
+				NODE* new_node = memory_pool[thread_id].get_node(key);
+				new_node->next = curr;
+				pred->next = new_node;
+				pred->unlock(); curr->unlock();
+				return true;
+			}
+		}
+	}
+
+	bool Remove(int key) {
+		while (true) {
+			NODE* pred = head;
+			NODE* curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			pred->lock(); curr->lock();
+			if (!validate(pred, curr)) {
+				pred->unlock(); curr->unlock();
+				continue;
+			}
+
+			if (curr->key == key) {
+				curr->removed = true;
+				pred->next = curr->next;
+				curr->unlock(); pred->unlock();
+				memory_pool[thread_id].free_node(curr);
+				return true;
+			}
+			else {
+				pred->unlock(); curr->unlock();
+				return false;
+			}
+		}
+	}
+	bool Contains(int key) {
+		while (true) {
+			NODE* pred = head;
+			NODE* curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			return ((curr->key == key) && (!curr->removed));
+		}
+	}
+
+
+	void print20() {
+		NODE* curr = head->next;
+		std::cout << curr->key;
+		curr = curr->next;
+		int count = 0;
+		while (curr != tail && count < 19) {
+			std::cout << ", " << curr->key;
+			curr = curr->next;
+			count++;
+		}
+		std::cout << std::endl;
+	}
+};
+
+class NODE_SP {
+public:
+	int key;
+	std::shared_ptr<NODE_SP> next;
+	bool removed = false;
+	std::mutex mtx;
+
+	NODE_SP(int key_value) : key(key_value), next(nullptr) {}
+	void lock() { mtx.lock(); }
+	void unlock() { mtx.unlock(); }
+};
+
+class ZLISTSP {
+	std::shared_ptr<NODE_SP> head, tail;
+public:
+	ZLISTSP() {
+		std::cout << "Testing lazy synchronization List\n";
+		head = std::make_shared<NODE_SP>(std::numeric_limits<int>::min());
+		tail = std::make_shared<NODE_SP>(std::numeric_limits<int>::max());
+		head->next = tail;
+	}
+	~ZLISTSP() {}
+
+	void clear() {
+		head->next = tail;
+	}
+
+	bool validate(const std::shared_ptr<NODE_SP> &pred, const std::shared_ptr<NODE_SP> &curr) {
+		return ((!pred->removed) && (!curr->removed) && (pred->next == curr));
+	}
+
+	bool Add(int key) {
+		while (true)
+		{
+			std::shared_ptr<NODE_SP> pred = head;
+			std::shared_ptr<NODE_SP> curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			pred->lock(); curr->lock();
+			if (false == validate(pred, curr)) {
+				pred->unlock(); curr->unlock();
+				continue;
+			}
+
+			if (curr->key == key)
+			{
+				pred->unlock(); curr->unlock();
+				return false;
+			}
+			else
+			{
+				std::shared_ptr<NODE_SP> new_node = std::make_shared<NODE_SP>(key);
+				new_node->next = curr;
+				pred->next = new_node;
+				pred->unlock(); curr->unlock();
+				return true;
+			}
+		}
+	}
+
+	bool Remove(int key) {
+		while (true) {
+			std::shared_ptr<NODE_SP> pred = head;
+			std::shared_ptr<NODE_SP> curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			pred->lock(); curr->lock();
+			if (!validate(pred, curr)) {
+				pred->unlock(); curr->unlock();
+				continue;
+			}
+
+			if (curr->key == key) {
+				curr->removed = true;
+				pred->next = curr->next;
+				curr->unlock(); pred->unlock();
+				return true;
+			}
+			else {
+				pred->unlock(); curr->unlock();
+				return false;
+			}
+		}
+	}
+	bool Contains(int key) {
+		while (true) {
+			std::shared_ptr<NODE_SP> pred = head;
+			std::shared_ptr<NODE_SP> curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			return ((curr->key == key) && (!curr->removed));
+		}
+	}
+
+
+	void print20() {
+		std::shared_ptr<NODE_SP> curr = head->next;
+		std::cout << curr->key;
+		curr = curr->next;
+		int count = 0;
+		while (curr != tail && count < 19) {
+			std::cout << ", " << curr->key;
+			curr = curr->next;
+			count++;
+		}
+		std::cout << std::endl;
+	}
+};
+
+class NODE_ASP {
+public:
+	int key;
+	std::atomic<std::shared_ptr<NODE_ASP>> next;
+	bool removed = false;
+	std::mutex mtx;
+
+	NODE_ASP(int key_value) : key(key_value), next(nullptr) {}
+	void lock() { mtx.lock(); }
+	void unlock() { mtx.unlock(); }
+};
+
+class ZLISTASP {
+	std::atomic<std::shared_ptr<NODE_ASP>> head, tail;
+public:
+	ZLISTASP() {
+		std::cout << "Testing lazy synchronization List\n";
+		head = std::make_shared<NODE_ASP>(std::numeric_limits<int>::min());
+		tail = std::make_shared<NODE_ASP>(std::numeric_limits<int>::max());
+		head.load()->next = tail.load();
+	}
+	~ZLISTASP() {}
+
+	void clear() {
+		head.load()->next = tail.load();
+	}
+
+	bool validate(const std::shared_ptr<NODE_ASP>& pred, const std::shared_ptr<NODE_ASP>& curr) {
+		return ((!pred->removed) && (!curr->removed) && (pred->next.load() == curr));
+	}
+
+	bool Add(int key) {
+		while (true)
+		{
+			std::shared_ptr<NODE_ASP> pred = head;
+			std::shared_ptr<NODE_ASP> curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			pred->lock(); curr->lock();
+			if (false == validate(pred, curr)) {
+				pred->unlock(); curr->unlock();
+				continue;
+			}
+
+			if (curr->key == key)
+			{
+				pred->unlock(); curr->unlock();
+				return false;
+			}
+			else
+			{
+				std::shared_ptr<NODE_ASP> new_node = std::make_shared<NODE_ASP>(key);
+				new_node->next = curr;
+				pred->next.load() = new_node;
+				pred->unlock(); curr->unlock();
+				return true;
+			}
+		}
+	}
+
+	bool Remove(int key) {
+		while (true) {
+			std::shared_ptr<NODE_ASP> pred = head.load();
+			std::shared_ptr<NODE_ASP> curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			pred->lock(); curr->lock();
+			if (!validate(pred, curr)) {
+				pred->unlock(); curr->unlock();
+				continue;
+			}
+
+			if (curr->key == key) {
+				curr->removed = true;
+				pred->next.load() = curr->next;
+				curr->unlock(); pred->unlock();
+				return true;
+			}
+			else {
+				pred->unlock(); curr->unlock();
+				return false;
+			}
+		}
+	}
+	bool Contains(int key) {
+		while (true) {
+			std::shared_ptr<NODE_ASP> pred = head;
+			std::shared_ptr<NODE_ASP> curr = pred->next;
+
+			while (curr->key < key) {
+				pred = curr;
+				curr = curr->next;
+			}
+
+			return ((curr->key == key) && (!curr->removed));
+		}
+	}
+
+
+	void print20() {
+		std::shared_ptr<NODE_ASP> curr = head.load()->next;
+		std::cout << curr->key;
+		curr = curr->next;
+		int count = 0;
+		while (curr != tail.load() && count < 19) {
+			std::cout << ", " << curr->key;
+			curr = curr->next;
+			count++;
+		}
+		std::cout << std::endl;
+	}
+};
+
+ZLISTSP my_set;
 
 class HISTORY {
 public:
@@ -486,6 +862,7 @@ void benchmark_check(int num_threads, int th_id)
 		}
 		}
 	}
+	memory_pool[thread_id].recycle_nodes();
 }
 
 void benchmark(int num_thread, int tid)
@@ -509,6 +886,7 @@ void benchmark(int num_thread, int tid)
 			exit(-1);
 		}
 	}
+	memory_pool[thread_id].recycle_nodes();
 }
 
 int main()
@@ -528,7 +906,7 @@ int main()
 		auto elapsed = end_time - start_time;
 		auto exec_ms = duration_cast<milliseconds>(elapsed).count();
 		my_set.print20();
-		std::cout << "Threads: " << num_threads << ", Time: " << exec_ms << " seconds\n";
+		std::cout << "Threads: " << num_threads << ", Time: " << exec_ms << " ms\n";
 		check_history(num_threads);
 		my_set.clear();
 	}
@@ -547,7 +925,7 @@ int main()
 		auto elapsed = end_time - start_time;
 		auto exec_ms = duration_cast<milliseconds>(elapsed).count();
 		my_set.print20();
-		std::cout << "Threads: " << num_threads << ", Time: " << exec_ms << " seconds\n";
+		std::cout << "Threads: " << num_threads << ", Time: " << exec_ms << " ms\n";
 		my_set.clear();
 	}
 }
