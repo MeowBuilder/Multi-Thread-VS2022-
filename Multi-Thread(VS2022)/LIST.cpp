@@ -760,6 +760,7 @@ class LFNODE {
 	std::atomic_llong next;
 public:
 	int data;
+	long long epoch;
 	LFNODE(int value) : data(value), next(0) {}
 	void set_next(LFNODE* next_node) {
 		next = reinterpret_cast<long long>(next_node);
@@ -827,6 +828,58 @@ public:
 };
 
 LF_MEMORY_POOL lf_memory_pool[MAX_THREADS];
+
+
+class EBR {
+	alignas(64) std::atomic_llong g_epoch = 0;
+	class ThreadInfo {
+	public:
+		alignas(64) std::atomic_llong local_epoch;
+		std::queue<LFNODE*> free_nodes;
+		ThreadInfo() {
+			local_epoch = std::numeric_limits<long long>::max();
+		}
+		~ThreadInfo() {
+			while (!free_nodes.empty()) {
+				delete free_nodes.front();
+				free_nodes.pop();
+			}
+		}
+	};
+	ThreadInfo thread_info[MAX_THREADS];
+	public:
+	void enter() {
+		g_epoch.fetch_add(1);
+		thread_info[thread_id].local_epoch = g_epoch.load();
+	}
+	void leave() {
+		thread_info[thread_id].local_epoch = std::numeric_limits<long long>::max();
+	}
+	void free_node(LFNODE* node) { 
+		node->epoch = g_epoch;
+		thread_info[thread_id].free_nodes.push(node);
+	}
+	LFNODE* get_node(int x) {
+		if (thread_info[thread_id].free_nodes.empty()) {
+			return new LFNODE(x);
+		}
+		else {
+			LFNODE* node = thread_info[thread_id].free_nodes.front();
+			long long current_epoch = g_epoch;
+			for (int i = 0; i < MAX_THREADS; ++i) {
+				if (thread_info[i].local_epoch <= node->epoch) {
+					return new LFNODE(x);
+				}
+			}
+			thread_info[thread_id].free_nodes.pop();
+			node->data = x;
+			node->set_next(nullptr);
+			return node;
+		}
+	}
+};
+
+EBR ebr;
 
 class LFLIST {
 private:
@@ -934,7 +987,125 @@ public:
 	}
 };
 
-LFLIST my_set;
+class LFEBRLIST {
+private:
+	LFNODE* head, * tail;
+public:
+	LFEBRLIST()
+	{
+		std::cout << "Testing Lock Free EBR Synchronization List\n";
+		head = new LFNODE{ std::numeric_limits<int>::min() };
+		tail = new LFNODE{ std::numeric_limits<int>::max() };
+		head->set_next(tail);
+	}
+
+	~LFEBRLIST() {
+		clear();
+		delete head;
+		delete tail;
+	}
+
+	void clear()
+	{
+		LFNODE* current = head->get_next();
+		while (head->get_next() != tail) {
+			LFNODE* temp = head->get_next();
+			head->set_next(temp->get_next());
+			delete temp;
+		}
+	}
+
+	void find(int x, LFNODE*& pred, LFNODE*& curr)
+	{
+	retry:
+		pred = head;
+		curr = pred->get_next();
+		while (true) {
+			// Check if curr is marked as removed
+			bool removed = false;
+			while (true) {
+				LFNODE* succ = curr->get_next(&removed);
+				if (false == removed) break; // If curr is not removed, break the inner loop
+				if (false == pred->CAS(curr, succ, false, false)) goto retry;
+				ebr.free_node(curr);
+				curr = succ;
+			}
+			if (curr->data >= x) break;
+			pred = curr;
+			curr = curr->get_next();
+		}
+	}
+
+	bool Add(int x)
+	{
+		ebr.enter();
+		LFNODE* pred, * curr;
+		while (true) {
+			find(x, pred, curr);
+			if (curr->data == x) {
+				ebr.leave();
+				return false; // Element already exists
+			}
+			else {
+				LFNODE* new_node = ebr.get_node(x);
+				new_node->set_next(curr);
+				if (true == pred->CAS(curr, new_node, false, false)) {
+					ebr.leave();
+					return true; // Attempt to link the new node between pred and curr
+				}
+				ebr.free_node(new_node);
+			}
+		}
+	}
+
+	bool Remove(int x)
+	{
+		ebr.enter();
+		LFNODE* pred, * curr;
+		while (true) {
+
+			find(x, pred, curr);
+
+			if (curr->data != x) {
+				ebr.leave();
+				return false;
+			}
+			else {
+				LFNODE* succ = curr->get_next();
+				if (!curr->CAS(succ, succ, false, true)) continue;
+				if (pred->CAS(curr, succ, false, false)) {
+					ebr.free_node(curr);
+				}
+				ebr.leave();
+				return true;
+			}
+		}
+	}
+
+	bool Contains(int x)
+	{
+		LFNODE* n = head;
+		while (n->data < x) {
+			n = n->get_next();
+		}
+		return (n->data == x) && (false == n->get_mark()); // Check if the node exists and is not removed
+	}
+
+	void print20()
+	{
+		LFNODE* curr = head->get_next();
+		int count = 0;
+		while (curr != tail && count < 20) {
+			std::cout << curr->data << ", ";
+			curr = curr->get_next();
+			count++;
+		}
+		std::cout << "\n";
+	}
+};
+
+
+LFEBRLIST my_set;
 
 #include <array>
 
@@ -1061,6 +1232,7 @@ int main()
 		my_set.clear();
 	}
 
+	for (auto& h : history) h.clear();
 	std::cout << "Strting Performance Check.\n";
 	for (int num_threads = 1; num_threads <= MAX_THREADS; num_threads *= 2) {
 		std::vector<std::thread> threads;
@@ -1077,5 +1249,7 @@ int main()
 		my_set.print20();
 		std::cout << "Threads: " << num_threads << ", Time: " << exec_ms << " seconds\n";
 		my_set.clear();
+		std::string temp;
+		std::getline(std::cin,temp);
 	}
 }
