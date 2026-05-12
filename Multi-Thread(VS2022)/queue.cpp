@@ -215,7 +215,7 @@ class LFNODE {
 public:
 	int data;
 	long long epoch;
-	LFNODE(int value) : data(value), next(0) {}
+	LFNODE(int value) : data(value), next(0), epoch(0) {}
 	void set_next(LFNODE* next_node) {
 		next = reinterpret_cast<long long>(next_node);
 	}
