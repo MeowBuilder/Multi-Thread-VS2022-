@@ -5,7 +5,7 @@
 #include <mutex>
 #include <queue>
 
-constexpr int MAX_THREADS = 32;
+constexpr int MAX_THREADS = 16;
 constexpr int NUM_TEST = 1000'0000;
 
 class NODE {
@@ -148,7 +148,172 @@ public:
 	}
 };
 
-LFSTACK my_stack;
+class BACKOFF {
+	int minDelay, maxDelay;
+	int limit;
+public:
+	BACKOFF(int min, int max)
+		: minDelay(min), maxDelay(max), limit(min) {}
+
+	void pause() {
+		int delay = rand() & (limit + 1);
+		limit *= 2;
+		if (limit > maxDelay) limit = maxDelay;
+		std::this_thread::sleep_for(std::chrono::microseconds(delay));
+	}
+};
+
+class LFBOSTACK {
+private:
+	NODE* volatile top;
+public:
+	bool CAS(NODE* volatile* addr, NODE* expected, NODE* new_node) {
+		return std::atomic_compare_exchange_strong(
+			reinterpret_cast<std::atomic<NODE*> volatile*>(addr),
+			&expected,
+			new_node
+		);
+	}
+
+	LFBOSTACK()
+	{
+		std::cout << "Testing Lock Free Synchronization BackOff Stack\n";
+		top = nullptr;
+	}
+
+	~LFBOSTACK()
+	{
+		clear();
+	}
+
+	void clear()
+	{
+		while (top != nullptr) {
+			NODE* temp = top;
+			top = top->next;
+			delete temp;
+		}
+	}
+
+	void Push(int x)
+	{
+		BACKOFF bo(1, 1000);
+		NODE* e = new NODE{ x };
+		while (true) {
+			NODE* ptr = top;
+			e->next = ptr;
+			if (CAS(&top, ptr, e)) {
+				return;
+			}
+			bo.pause();
+		}
+	}
+
+	int Pop()
+	{
+		BACKOFF bo(1, 1000);
+		while (true) {
+			NODE* ptr = top;
+			if (nullptr == ptr) {
+				return -2;
+			}
+			if (CAS(&top, ptr, ptr->next)) {
+				int temp = ptr->data;
+				//delete ptr;
+				return temp;
+			}
+			bo.pause();
+		}
+	}
+
+	void print20()
+	{
+		NODE* curr = top;
+		int count = 0;
+		while (curr != nullptr && count < 20) {
+			std::cout << curr->data << ", ";
+			curr = curr->next;
+			count++;
+		}
+		std::cout << "\n";
+	}
+};
+
+class LFBOSTACK_Y {
+private:
+	NODE* volatile top;
+public:
+	bool CAS(NODE* volatile* addr, NODE* expected, NODE* new_node) {
+		return std::atomic_compare_exchange_strong(
+			reinterpret_cast<std::atomic<NODE*> volatile*>(addr),
+			&expected,
+			new_node
+		);
+	}
+
+	LFBOSTACK_Y()
+	{
+		std::cout << "Testing Lock Free Synchronization BackOff(yield) Stack\n";
+		top = nullptr;
+	}
+
+	~LFBOSTACK_Y()
+	{
+		clear();
+	}
+
+	void clear()
+	{
+		while (top != nullptr) {
+			NODE* temp = top;
+			top = top->next;
+			delete temp;
+		}
+	}
+
+	void Push(int x)
+	{
+		NODE* e = new NODE{ x };
+		while (true) {
+			NODE* ptr = top;
+			e->next = ptr;
+			if (CAS(&top, ptr, e)) {
+				return;
+			}
+			std::this_thread::yield();
+		}
+	}
+
+	int Pop()
+	{
+		while (true) {
+			NODE* ptr = top;
+			if (nullptr == ptr) {
+				return -2;
+			}
+			if (CAS(&top, ptr, ptr->next)) {
+				int temp = ptr->data;
+				//delete ptr;
+				return temp;
+			}
+			std::this_thread::yield();
+		}
+	}
+
+	void print20()
+	{
+		NODE* curr = top;
+		int count = 0;
+		while (curr != nullptr && count < 20) {
+			std::cout << curr->data << ", ";
+			curr = curr->next;
+			count++;
+		}
+		std::cout << "\n";
+	}
+};
+
+LFBOSTACK my_stack;
 
 #include <array>
 #include <unordered_set>
