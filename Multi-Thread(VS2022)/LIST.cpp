@@ -7,7 +7,7 @@
 #include <set>
 
 constexpr int MAX_THREADS = 32;
-constexpr int NUM_TEST = 20000;
+constexpr int NUM_TEST = 4000000;
 constexpr int RANGE = 1000;
 
 class NODE {
@@ -1005,7 +1005,7 @@ private:
 public:
 	LFEBRLIST()
 	{
-		std::cout << "Testing Lock Free Synchronization List\n";
+		std::cout << "Testing Lock Free Synchronization EBR List\n";
 		head = new LFNODE{ std::numeric_limits<int>::min() };
 		tail = new LFNODE{ std::numeric_limits<int>::max() };
 		head->set_next(tail);
@@ -1109,7 +1109,6 @@ public:
 		std::cout << "\n";
 	}
 };
-
 
 // 싱글 쓰레드 통합 API
 enum INVO_OP { ADD = 0, REMOVE = 1, CONTAINS = 2 };
@@ -1398,7 +1397,125 @@ public:
 	}
 };
 
-STD_SET my_set;
+constexpr int MAX_NEXTS = 9;
+
+class SK_NODE {
+public:
+	int data;
+	SK_NODE* next[MAX_NEXTS] = { nullptr };
+	int num_nexts;
+	SK_NODE(int value) : data(value), num_nexts(1) {}
+	SK_NODE(int value, int num) : data(value), num_nexts(num) {}
+};
+
+class C_SKLIST {
+	SK_NODE* head, * tail;
+	std::mutex mtx;
+public:
+	C_SKLIST()
+	{
+		std::cout << "Testing Coarse Grain Skip List\n";
+		head = new SK_NODE(std::numeric_limits<int>::min(), MAX_NEXTS);
+		tail = new SK_NODE(std::numeric_limits<int>::max(), MAX_NEXTS);
+		for (int i = 0; i < MAX_NEXTS; ++i) {
+			head->next[i] = tail;
+		}
+	}
+	void clear()
+	{
+		SK_NODE* current = head->next[0];
+		while (head->next[0] != tail) {
+			SK_NODE* temp = head->next[0];
+			head->next[0] = temp->next[0];
+			delete temp;
+		}
+		for (int i = 1; i < MAX_NEXTS; ++i) {
+			head->next[i] = tail;
+		}
+	}
+	~C_SKLIST() {
+		clear();
+		delete head;
+		delete tail;
+	}
+
+	void Find(int x, SK_NODE* pred[], SK_NODE* curr[]) {
+		int found_level = -1;
+		SK_NODE* prev = head;
+
+		for (int level = MAX_NEXTS - 1; level >= 0; --level) {
+			if (level == MAX_NEXTS - 1)	pred[level] = head;
+			else pred[level] = pred[level + 1];
+			curr[level] = pred[level]->next[level];
+			while (curr[level]->data < x) {
+				pred[level] = curr[level];
+				curr[level] = curr[level]->next[level];
+			}
+		}
+	}
+
+	bool Add(int x)
+	{
+		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+		mtx.lock();
+		Find(x, pred, curr);
+		if (curr[0]->data != x) {
+			int num_nexts = 1;
+			while (num_nexts < MAX_NEXTS && rand() % 2 == 0) {
+				num_nexts++;
+			}
+			SK_NODE* new_node = new SK_NODE(x, num_nexts);
+			for (int i = 0; i < num_nexts; ++i) {
+				new_node->next[i] = curr[i];
+				pred[i]->next[i] = new_node;
+			}
+			mtx.unlock();
+			return true; // Element added successfully
+		}
+		mtx.unlock();
+		return false;
+	}
+
+	bool Remove(int x)
+	{
+		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+		mtx.lock();
+		Find(x, pred, curr);
+		if (curr[0]->data == x) {
+			for (int i = 0; i < curr[0]->num_nexts; ++i) {
+				pred[i]->next[i] = curr[i]->next[i];
+			}
+			delete curr[0];
+			mtx.unlock();
+			return true; // Element removed successfully
+		}
+		mtx.unlock();
+		return false;
+	}
+
+	bool Contains(int x)
+	{
+		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+		mtx.lock();
+		Find(x, pred, curr);
+		bool found = (curr[0]->data == x);
+		mtx.unlock();
+		return found;
+	}
+
+	void print20()
+	{
+		SK_NODE* curr = head->next[0];
+		for (int i = 0; i < 20 && curr != tail; ++i) {
+			std::cout << curr->data << ", ";
+			curr = curr->next[0];
+		}
+		std::cout << "\n";
+	}
+
+};
+
+C_SKLIST my_set;
 
 #include <array>
 
@@ -1479,7 +1596,6 @@ void benchmark_check(int num_threads, int th_id)
 	}
 	memory_pool[thread_id].recycle_nodes();
 }
-
 void benchmark(int num_threads, int tid)
 {
 	thread_id = tid;
