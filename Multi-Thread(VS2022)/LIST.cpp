@@ -6,9 +6,11 @@
 #include <queue>
 #include <set>
 
-constexpr int MAX_THREADS = 32;
-constexpr int NUM_TEST = 4000000;
+constexpr int MAX_THREADS = 16;
+constexpr int NUM_TEST = 400'0000;
 constexpr int RANGE = 1000;
+
+
 
 class NODE {
 public:
@@ -76,7 +78,7 @@ public:
 class CLIST {
 private:
 	NODE* head, * tail;
-	DUMMY_MUTEX mtx; // Mutex for thread safety
+	std::mutex mtx; // Mutex for thread safety
 public:
 	CLIST()
 	{
@@ -1005,7 +1007,7 @@ private:
 public:
 	LFEBRLIST()
 	{
-		std::cout << "Testing Lock Free Synchronization EBR List\n";
+		std::cout << "Testing Lock Free Synchronization List\n";
 		head = new LFNODE{ std::numeric_limits<int>::min() };
 		tail = new LFNODE{ std::numeric_limits<int>::max() };
 		head->set_next(tail);
@@ -1110,6 +1112,7 @@ public:
 	}
 };
 
+
 // 싱글 쓰레드 통합 API
 enum INVO_OP { ADD = 0, REMOVE = 1, CONTAINS = 2 };
 class INVOCATION {
@@ -1186,7 +1189,6 @@ class LFU_SET {
 public:
 	LFU_SET() {
 		tail = new LOGNODE(INVOCATION(CONTAINS, 0)); // dummy
-		tail->m_seq = 1;
 		for (int i = 0; i < MAX_THREADS; ++i) {
 			head[i] = tail;
 		}
@@ -1229,10 +1231,8 @@ public:
 			seq_set.apply(curr->m_inv);
 			curr = curr->m_next;
 		}
-
-		//if (prefer->m_seq % 1000 == 0)
-		//	std::cout << ".";
-
+		if (prefer->m_seq % 1000 == 0)
+			std::cout << ".";
 		return seq_set.apply(inv);
 	};
 
@@ -1240,100 +1240,6 @@ public:
 	{
 		for (int i = 0; i < MAX_THREADS; ++i) {
 			head[i] = tail;
-		}
-		LOGNODE* curr = tail->m_next;
-		while (nullptr != curr) {
-			LOGNODE* temp = curr;
-			curr = curr->m_next;
-			delete temp;
-		}
-		tail->m_next = nullptr;
-		tail->decide_next.clear();
-	}
-
-	void print20()
-	{
-		SEQ_SET seq_set;
-		LOGNODE* curr = tail->m_next;
-		while (nullptr != curr) {
-			seq_set.apply(curr->m_inv);
-			curr = curr->m_next;
-		}
-		seq_set.print20();
-	}
-};
-
-class WFU_SET {
-	LOGNODE* announce[MAX_THREADS];
-	LOGNODE* head[MAX_THREADS];
-	LOGNODE* tail;
-public:
-	WFU_SET() {
-		tail = new LOGNODE(INVOCATION(CONTAINS, 0)); // dummy
-		tail->m_seq = 1;
-		for (int i = 0; i < MAX_THREADS; ++i) {
-			head[i] = tail;
-			announce[i] = tail;
-		}
-	}
-
-	~WFU_SET()
-	{
-		while (nullptr != tail) {
-			LOGNODE* temp = tail;
-			tail = tail->m_next;
-			delete temp;
-		}
-	}
-
-	LOGNODE* max_head()
-	{
-		LOGNODE* max_node = head[0];
-		for (int i = 1; i < MAX_THREADS; ++i) {
-			if (max_node->m_seq < head[i]->m_seq)
-				max_node = head[i];
-		}
-		return max_node;
-	}
-
-	RESPONSE apply(INVOCATION inv)
-	{
-		int i = thread_id;
-		announce[i] = new LOGNODE(inv);
-		head[i] = max_head();
-
-		while (announce[i]->m_seq == 0) {
-			LOGNODE* before = head[i];
-			LOGNODE* help = announce[((before->m_seq + 1) % MAX_THREADS)];
-			LOGNODE* prefer;
-			if (help->m_seq == 0) prefer = help;
-			else prefer = announce[i];
-
-			LOGNODE* after = before->decide_next.decide(prefer);
-			before->m_next = after;
-			after->m_seq = before->m_seq + 1;
-			head[i] = after;
-		}
-
-		SEQ_SET seq_set;
-		LOGNODE* curr = tail->m_next;
-		while (curr != announce[i]) {
-			seq_set.apply(curr->m_inv);
-			curr = curr->m_next;
-		}
-
-		//if (announce[i]->m_seq % 1000 == 0)
-		//	std::cout << ".";
-
-		head[i] = announce[i];
-		return seq_set.apply(inv);
-	};
-
-	void clear()
-	{
-		for (int i = 0; i < MAX_THREADS; ++i) {
-			head[i] = tail;
-			announce[i] = tail;
 		}
 		LOGNODE* curr = tail->m_next;
 		while (nullptr != curr) {
@@ -1360,8 +1266,9 @@ public:
 // 벤치 마킹
 class STD_SET {
 private:
+	SEQ_SET m_set;
 	//LFU_SET m_set;
-	WFU_SET m_set;
+	//DUMMY_MTX mtx;
 public:
 	STD_SET() {}
 
@@ -1404,8 +1311,13 @@ public:
 	int data;
 	SK_NODE* next[MAX_NEXTS] = { nullptr };
 	int num_nexts;
+	volatile bool removed = false; // Flag to indicate if the node is removed
+	volatile bool fully_linked = false; // Flag to indicate if the node is fully linked in the list
+	std::recursive_mutex mtx;
 	SK_NODE(int value) : data(value), num_nexts(1) {}
 	SK_NODE(int value, int num) : data(value), num_nexts(num) {}
+	void lock() { mtx.lock(); }
+	void unlock() { mtx.unlock(); }
 };
 
 class C_SKLIST {
@@ -1415,8 +1327,8 @@ public:
 	C_SKLIST()
 	{
 		std::cout << "Testing Coarse Grain Skip List\n";
-		head = new SK_NODE(std::numeric_limits<int>::min(), MAX_NEXTS);
-		tail = new SK_NODE(std::numeric_limits<int>::max(), MAX_NEXTS);
+		head = new SK_NODE(std::numeric_limits<int>::min());
+		tail = new SK_NODE(std::numeric_limits<int>::max());
 		for (int i = 0; i < MAX_NEXTS; ++i) {
 			head->next[i] = tail;
 		}
@@ -1439,6 +1351,7 @@ public:
 		delete tail;
 	}
 
+	// 탐색 결과를 반환하는 Find: pred[], succ[] 배열을 채우고 해당 레벨에서의 발견 여부 반환
 	void Find(int x, SK_NODE* pred[], SK_NODE* curr[]) {
 		int found_level = -1;
 		SK_NODE* prev = head;
@@ -1475,7 +1388,6 @@ public:
 		mtx.unlock();
 		return false;
 	}
-
 	bool Remove(int x)
 	{
 		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
@@ -1492,17 +1404,18 @@ public:
 		mtx.unlock();
 		return false;
 	}
-
 	bool Contains(int x)
 	{
 		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
 		mtx.lock();
 		Find(x, pred, curr);
-		bool found = (curr[0]->data == x);
+		if (curr[0]->data == x) {
+			mtx.unlock();
+			return true; // Element found
+		}
 		mtx.unlock();
-		return found;
+		return false;
 	}
-
 	void print20()
 	{
 		SK_NODE* curr = head->next[0];
@@ -1515,7 +1428,192 @@ public:
 
 };
 
-C_SKLIST my_set;
+class L_SKLIST {
+	SK_NODE* head, * tail;
+public:
+	L_SKLIST()
+	{
+		std::cout << "Testing Lazy Skip List\n";
+		head = new SK_NODE(std::numeric_limits<int>::min());
+		tail = new SK_NODE(std::numeric_limits<int>::max());
+		for (int i = 0; i < MAX_NEXTS; ++i) {
+			head->next[i] = tail;
+		}
+	}
+	void clear()
+	{
+		SK_NODE* current = head->next[0];
+		while (head->next[0] != tail) {
+			SK_NODE* temp = head->next[0];
+			head->next[0] = temp->next[0];
+			delete temp;
+		}
+		for (int i = 1; i < MAX_NEXTS; ++i) {
+			head->next[i] = tail;
+		}
+	}
+	~L_SKLIST() {
+		clear();
+		delete head;
+		delete tail;
+	}
+
+	int Find(int x, SK_NODE* pred[], SK_NODE* curr[]) {
+		int found_level = -1;
+		for (int level = MAX_NEXTS - 1; level >= 0; --level) {
+			if (level == MAX_NEXTS - 1)	pred[level] = head;
+			else pred[level] = pred[level + 1];
+			curr[level] = pred[level]->next[level];
+			while (curr[level]->data < x) {
+				pred[level] = curr[level];
+				curr[level] = curr[level]->next[level];
+			}
+			if ((-1 == found_level) && (curr[level]->data == x))
+				found_level = level;
+		}
+		return found_level;
+	}
+
+	bool Add(int x)
+	{
+		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+
+		while (true) {
+			int findlevel = Find(x, pred, curr);
+			if (findlevel != -1) {
+				SK_NODE* target = curr[findlevel];
+				if (target->removed == false) {
+					while (target->fully_linked == false) {}
+					return false;
+				}
+				continue;
+			}
+
+			int num_nexts = 1;
+			while (num_nexts < MAX_NEXTS && rand() % 2 == 0) {
+				num_nexts++;
+			}
+
+			bool valid = true;
+			int highest_level = -1;
+
+			for (int i = 0; i < num_nexts; ++i) {
+				pred[i]->lock();
+				highest_level = i;
+				if (pred[i]->removed || pred[i]->next[i] != curr[i]) {
+					valid = false;
+					break;
+				}
+			}
+
+			if (false == valid) {
+				for (int i = 0; i <= highest_level; ++i)
+					pred[i]->unlock();
+				continue;
+			}
+
+			SK_NODE* new_node = new SK_NODE(x, num_nexts);
+			for (int i = 0; i < num_nexts; ++i) {
+				new_node->next[i] = curr[i];
+				pred[i]->next[i] = new_node;
+			}
+
+			for (int i = 0; i < num_nexts; ++i) {
+				pred[i]->unlock();
+			}
+			new_node->fully_linked = true;
+			return true;
+		}
+	}
+
+	bool Remove(int x)
+	{
+		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+
+		while (true) {
+			int level_found = Find(x, pred, curr);
+			if (level_found == -1) {
+				return false;
+			}
+
+			SK_NODE* victim = curr[level_found];
+
+			// 논리적 삭제 여부 및 연결 완료 여부 확인
+			if (victim->removed || !victim->fully_linked) {
+				return false;
+			}
+
+			victim->lock();
+			if (victim->removed) {
+				victim->unlock();
+				return false; // 타 스레드가 먼저 선점하여 삭제함
+			}
+			victim->removed = true; // 논리적 삭제 마킹
+
+			bool valid = true;
+			int highest_level = -1;
+
+			for (int i = 0; i < victim->num_nexts; ++i) {
+				pred[i]->lock();
+				highest_level = i;
+				if (!pred[i]->removed && pred[i]->next[i] == victim) {
+					continue;
+				}
+				else {
+					valid = false;
+					break;
+				}
+			}
+
+			if (false == valid) {
+				// 유효성 실패 시 잠갔던 pred들과 victim을 모두 풀고 '처음부터' 완전히 다시 시작
+				for (int i = 0; i <= highest_level; ++i) {
+					pred[i]->unlock();
+				}
+				victim->removed = false; // 마킹 원복
+				victim->unlock();
+				continue; // 대기하지 않고 외곽 while의 처음(Find)으로 돌아감
+			}
+
+			// 물리적 연결 해제 (Bypass)
+			for (int i = victim->num_nexts - 1; i >= 0; --i) {
+				pred[i]->next[i] = victim->next[i];
+			}
+
+			for (int i = 0; i < victim->num_nexts; ++i) {
+				pred[i]->unlock();
+			}
+			victim->unlock();
+
+			// 주의: 멀티스레드 환경이므로 delete victim; 을 여기서 즉시 하면 
+			// Contains나 다른 Find를 수행 중인 스레드가 댕글링 포인터를 참조해 크래시가 날 수 있습니다.
+			// (동작 검증을 위해 유지하되, 실서비스엔 가비지 컬렉션/Hazard Pointer 등이 필요합니다)
+
+			return true;
+		}
+	}
+
+	bool Contains(int x)
+	{
+		SK_NODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+		int found_level = Find(x, pred, curr);
+		return ((found_level != -1)
+			&& (curr[found_level]->removed == false)
+			&& (curr[found_level]->fully_linked == true));
+	}
+
+	void print20()
+	{
+		SK_NODE* curr = head->next[0];
+		for (int i = 0; i < 20 && curr != tail; ++i) {
+			std::cout << curr->data << ", ";
+			curr = curr->next[0];
+		}
+		std::cout << "\n";
+	}
+};
+
+L_SKLIST my_set;
 
 #include <array>
 
