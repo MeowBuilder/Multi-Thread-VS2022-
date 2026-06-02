@@ -1585,10 +1585,6 @@ public:
 			}
 			victim->unlock();
 
-			// 주의: 멀티스레드 환경이므로 delete victim; 을 여기서 즉시 하면 
-			// Contains나 다른 Find를 수행 중인 스레드가 댕글링 포인터를 참조해 크래시가 날 수 있습니다.
-			// (동작 검증을 위해 유지하되, 실서비스엔 가비지 컬렉션/Hazard Pointer 등이 필요합니다)
-
 			return true;
 		}
 	}
@@ -1613,7 +1609,177 @@ public:
 	}
 };
 
-L_SKLIST my_set;
+class SK_LFNODE {
+	std::atomic_llong nexts[MAX_NEXTS];
+public:
+	int num_nexts;
+	int data;
+	long long epoch;
+	SK_LFNODE(int value, int num_floor) : data(value), nexts{ 0 }, num_nexts(num_floor) {}
+	void set_next(int index, SK_LFNODE* next_node) {
+		nexts[index] = reinterpret_cast<long long>(next_node);
+	}
+	SK_LFNODE* get_next(int index) {
+		return reinterpret_cast<SK_LFNODE*>(nexts[index].load() & 0xFFFFFFFFFFFFFFFC);
+	}
+	SK_LFNODE* get_next(int index, bool* removed) {
+		long long temp = nexts[index].load();
+		*removed = (temp & 1) == 1; // Check if the least significant bit is set (marked as removed)
+		return reinterpret_cast<SK_LFNODE*>(temp & 0xFFFFFFFFFFFFFFFC);
+	}
+	bool get_mark(int index) {
+		return (nexts[index].load() & 1) == 1; // Check if the least significant bit is set (marked as removed)
+	}
+	bool CAS(int index, SK_LFNODE* expected_node, SK_LFNODE* new_node,
+		bool expected_removed, bool new_removed)
+	{
+		long long expected_value = reinterpret_cast<long long>(expected_node) | (expected_removed ? 1 : 0);
+		long long new_value = reinterpret_cast<long long>(new_node) | (new_removed ? 1 : 0);
+		return nexts[index].compare_exchange_strong(expected_value, new_value);
+	}
+};
+
+class LF_SKLIST {
+	SK_LFNODE* head, * tail;
+public:
+	LF_SKLIST()
+	{
+		std::cout << "Testing Lock Free Skip List\n";
+		head = new SK_LFNODE(std::numeric_limits<int>::min(), MAX_NEXTS);
+		tail = new SK_LFNODE(std::numeric_limits<int>::max(), MAX_NEXTS);
+		for (int i = 0; i < MAX_NEXTS; ++i) {
+			head->set_next(i, tail);
+		}
+	}
+	void clear()
+	{
+		SK_LFNODE* current = head->get_next(0);
+		while (head->get_next(0) != tail) {
+			SK_LFNODE* temp = head->get_next(0);
+			head->set_next(0, temp->get_next(0));
+			delete temp;
+		}
+		for (int i = 1; i < MAX_NEXTS; ++i) {
+			head->set_next(i, tail);
+		}
+	}
+	~LF_SKLIST() {
+		clear();
+		delete head;
+		delete tail;
+	}
+
+	bool Find(int x, SK_LFNODE* pred[], SK_LFNODE* currs[]) {
+		SK_LFNODE* prev = head;
+	retry:
+		for (int level = MAX_NEXTS - 1; level >= 0; --level) {
+			if (level == MAX_NEXTS - 1)	pred[level] = head;
+			else pred[level] = pred[level + 1];
+
+			currs[level] = pred[level]->get_next(level);
+
+			while (true) {
+				bool removed = false;
+				SK_LFNODE* succ = currs[level]->get_next(level, &removed); // Ensure visibility of the next pointer before checking data
+				while (removed) {
+					if (false == pred[level]->CAS(level, currs[level], succ, false, false))
+						goto retry; // Retry if CAS fails
+					currs[level] = succ;
+					succ = currs[level]->get_next(level, &removed); // Ensure visibility of the next pointer before checking data
+				}
+
+				if (currs[level]->data < x) {
+					pred[level] = currs[level];
+					currs[level] = succ;
+				}
+				else break;
+			}
+		}
+		return currs[0]->data == x;
+	}
+
+	bool Add(int x)
+	{
+		SK_LFNODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+		int num_nexts = 1;
+		while (num_nexts < MAX_NEXTS && rand() % 2 == 0) {
+			num_nexts++;
+		}
+
+		while (true) {
+			bool found = Find(x, pred, curr);
+			if (true == found) return false;
+
+			SK_LFNODE* new_node = new SK_LFNODE(x, num_nexts);
+			for (int i = 0; i < num_nexts; ++i)
+				new_node->set_next(i, curr[i]);
+
+			if (false == pred[0]->CAS(0, curr[0], new_node, false, false))
+				continue;
+
+			for (int i = 1; i < num_nexts; ++i) {
+				while (true) {
+					if (false == pred[i]->CAS(i, curr[i], new_node, false, false)) {
+						Find(x, pred, curr);
+					}
+					else break;
+				}
+			}
+			return true;
+		}
+	}
+	bool Remove(int x)
+	{
+		SK_LFNODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+
+		bool found = Find(x, pred, curr);
+		if (false == found) return false; // Element not found
+
+		SK_LFNODE* victim = curr[0];
+
+		for (int i = victim->num_nexts - 1; i >= 1; --i) {
+			while (true) {
+				bool removed = false;
+				SK_LFNODE* succ = victim->get_next(i, &removed);
+				if (true == removed) break; // Already marked as removed at this level
+				if (true == victim->CAS(i, succ, succ, false, true))
+					break; // Mark the node as removed at this level
+				Find(x, pred, curr); // Retry if CAS fails, to ensure visibility of the next pointer before checking data
+			}
+		}
+
+		while (true) {
+			bool removed = false;
+			SK_LFNODE* succ = victim->get_next(0, &removed);
+			if (true == removed) return false; // Already marked as removed at the lowest level
+			if (true == victim->CAS(0, succ, succ, false, true)) {
+				Find(x, pred, curr);
+				return true;
+			} // Mark the node as removed at the lowest level
+		}
+	}
+
+	bool Contains(int x)
+	{
+		SK_LFNODE* pred[MAX_NEXTS], * curr[MAX_NEXTS];
+		bool found = Find(x, pred, curr);
+		return (true == found)
+			&& (curr[0]->get_mark(0) == false)
+			&& (pred[0]->get_next(0) == curr[0]);
+	}
+	void print20()
+	{
+		SK_LFNODE* curr = head->get_next(0);
+		for (int i = 0; i < 20 && curr != tail; ++i) {
+			std::cout << curr->data << ", ";
+			curr = curr->get_next(0);
+		}
+		std::cout << "\n";
+	}
+
+};
+
+LF_SKLIST my_set;
 
 #include <array>
 
